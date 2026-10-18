@@ -52,16 +52,29 @@ Python 3.10+. Tested on 3.14.
 
 ## Use
 
+Two subcommands. `trace` captures, `cover` checks a patch against what was
+captured.
+
 ```sh
-python facet_trace.py <script.py> \
-    --trigger <function_name> \
-    --prefixes path/one,path/two \
+python facet_trace.py trace --script repro.py \
+    --trigger prepare_value \
+    --prefixes app/forms,app/core \
     --depth 10 \
-    --out events.jsonl
+    --label "form field renders unescaped" \
+    --out facet1.jsonl
 ```
 
-Everything except the script is optional. Without `--trigger` it records from
-script start; without `--prefixes` it records every non-stdlib frame.
+Everything except the target is optional. Without `--trigger` it records from
+the start; without `--prefixes` it records every non-stdlib frame.
+
+Use `--module` instead of `--script` when the reproduction has to go through
+the repo's own test runner to get its fixtures and framework bootstrap, which
+in any framework-heavy codebase is most of the time:
+
+```sh
+python facet_trace.py trace --module pytest --trigger prepare_value \
+    --prefixes app -- tests/test_fields.py -x
+```
 
 ## Reading the header
 
@@ -108,6 +121,48 @@ The tracer has the full event log in hand, so it can compute which depth fits
 rather than just refusing. One re-trace with a number instead of several with
 guesses.
 
+## Checking coverage
+
+An issue usually states several behaviours. An agent can satisfy one, believe
+it is finished, and submit — which is the partial-patch failure SWE-Doctor
+measured and neither system detects.
+
+`cover` intersects the files a patch touched with the files each facet's
+execution actually ran through:
+
+```sh
+python facet_trace.py cover facet1.jsonl facet2.jsonl
+```
+
+```
+patch touches 1 file(s)
+  app/forms/fields.py
+
+facet  form field renders unescaped
+  executed 2 file(s)
+  INCONCLUSIVE patch touches 1 of them:
+    app/forms/fields.py
+
+facet  admin display renders unescaped
+  executed 2 file(s)
+  NOT ADDRESSED the patch touches nothing this facet executes,
+                so it cannot have changed this behaviour.
+                this facet runs through:
+                  app/admin/utils.py
+                  app/core/serial.py
+
+1 of 2 facet(s) provably not addressed.
+```
+
+The asymmetry is deliberate. An empty intersection is a proof — the patch did
+not alter one line this facet executes, so it cannot have changed this
+behaviour. A non-empty intersection proves nothing, because the patch may have
+landed in a function the facet never calls, so it escalates rather than
+clearing the facet.
+
+Changed files come from `git diff --name-only` by default. `--ref` diffs
+against another commit, `--changed` takes an explicit list.
+
 ## What it does differently
 
 | | DAIRA's `run_hunter_trace` | this |
@@ -141,14 +196,19 @@ report differences that are not differences.
 Module-level frames carry the entire module namespace as locals, which is
 thousands of tokens of imports and dunders, so their arguments are suppressed.
 
+Installed dependencies are left out of the out-of-scope report. A repo's bug is
+rarely inside one, and listing them would invite an agent to widen its scope
+into pytest. `--census-third-party` includes them; a prefix naming one
+explicitly still records it.
+
 ## Status
 
 Built and tested: the tracer, the header signals, the deterministic tree, the
-canonical event file.
+canonical event file with its metadata sidecar, and the coverage check.
 
-Designed, not built: the agent skill that drives it, per-behaviour test
-generation, the patch-set-against-trace-set intersection check, and the scrubbed
-pre/post trace diff. Those live in the design notes, not in this repo.
+Designed, not built: the agent skill that drives the whole loop, per-behaviour
+test generation, and the scrubbed pre/post trace diff that would resolve the
+inconclusive cases `cover` escalates.
 
 ## Limits
 

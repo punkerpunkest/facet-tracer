@@ -52,6 +52,19 @@ ADDRESS = re.compile(r"0x[0-9a-fA-F]{4,}")
 _TOOL_FILE = os.path.basename(__file__)
 
 
+def is_third_party(module: str) -> bool:
+    """
+    Installed dependencies. A repo's bug is rarely inside one, and listing them
+    in the out-of-scope report would invite an agent to go widen its scope into
+    pytest. They are still recorded if a prefix names them explicitly.
+    """
+    return (
+        "site-packages" in module
+        or "dist-packages" in module
+        or f"{os.sep}.venv{os.sep}" in module
+    )
+
+
 def is_tool_frame(module: str) -> bool:
     """
     Frames belonging to the interpreter's own plumbing or to this tool. They are
@@ -128,8 +141,9 @@ class Recorder:
 
     def __init__(self, prefixes: list[str], max_invocations: int, root: str,
                  include_comprehensions: bool = False, has_trigger: bool = True,
-                 max_events: int = 100_000):
+                 max_events: int = 100_000, census_third_party: bool = False):
         self.has_trigger = has_trigger
+        self.census_third_party = census_third_party
         self.include_comprehensions = include_comprehensions
         self.prefixes = prefixes
         self.max_invocations = max_invocations
@@ -156,6 +170,8 @@ class Recorder:
         depth = event.depth
 
         if is_tool_frame(module):
+            return
+        if is_third_party(module) and not self.census_third_party and not self.in_scope(module):
             return
         if not self.include_comprehensions and event.function in SYNTHETIC_FRAMES:
             return
@@ -229,7 +245,7 @@ class RunResult:
     stderr: str = ""
 
 
-def run(script: str, argv: list[str], predicate) -> RunResult:
+def run(script: str | None, module: str | None, argv: list[str], predicate) -> RunResult:
     """
     Execute the script in this interpreter with the tracer already installed.
 
@@ -240,18 +256,28 @@ def run(script: str, argv: list[str], predicate) -> RunResult:
     whole teardown into the tree.
     """
     saved_argv = sys.argv[:]
-    sys.argv = [script, *argv]
+    saved_path = sys.path[:]
+    sys.argv = [script or module, *argv]
+    # Match the interpreter: `python script.py` puts the script's directory at
+    # the front of sys.path, and `python -m mod` puts the cwd there. runpy does
+    # neither, so without this a reproduction script cannot import the repo it
+    # is meant to be reproducing a bug in.
+    sys.path.insert(0, os.path.abspath(os.path.dirname(script)) if script else os.getcwd())
     result = RunResult()
     out, err = io.StringIO(), io.StringIO()
     try:
         with hunter.trace(predicate, actions=[]):
             try:
                 with redirect_stdout(out), redirect_stderr(err):
-                    runpy.run_path(script, run_name="__main__")
+                    if script:
+                        runpy.run_path(script, run_name="__main__")
+                    else:
+                        runpy.run_module(module, run_name="__main__", alter_sys=True)
             except BaseException as exc:          # the script failing is the point
                 result.error = exc
     finally:
         sys.argv = saved_argv
+        sys.path[:] = saved_path
         result.stdout = out.getvalue()
         result.stderr = err.getvalue()
     return result
@@ -391,7 +417,7 @@ def render_header(args, recorder: Recorder, result: RunResult, cap: int) -> str:
 
     lines = [
         "=== header ===",
-        f"script          {args.script}",
+        f"target          {args.script or ('-m ' + args.module)}",
         f"prefixes        {', '.join(args.prefixes) if args.prefixes else '(none — all non-stdlib)'}",
         f"depth           {args.depth}",
         (
@@ -444,15 +470,101 @@ def render_header(args, recorder: Recorder, result: RunResult, cap: int) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- coverage
+
+
+def load_events(path: str) -> tuple[list[dict], dict]:
+    """Read a canonical event file and its sidecar metadata, if present."""
+    rows = []
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    meta_path = path + ".meta.json"
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as handle:
+            meta = json.load(handle)
+    return rows, meta
+
+
+def changed_files_from_git(ref: str | None) -> list[str]:
+    """Files the working tree changes relative to `ref` (HEAD by default)."""
+    import subprocess
+
+    command = ["git", "diff", "--name-only"]
+    if ref:
+        command.append(ref)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"git diff failed: {result.stderr.strip()}")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def coverage_report(event_files: list[str], changed: list[str]) -> tuple[str, int]:
+    """
+    For each facet, intersect the files the patch touched with the files that
+    facet's execution actually ran through.
+
+    An empty intersection is a proof, not a hint: the patch cannot have changed
+    this facet's behaviour, because it did not alter a single line this facet
+    executes. A non-empty intersection proves nothing either way — the patch
+    landed in a file the facet uses, but possibly in a function it never calls —
+    so it escalates rather than clearing the facet.
+    """
+    changed_set = {c.lstrip("./") for c in changed}
+    lines = ["=== coverage ===", f"patch touches {len(changed_set)} file(s)"]
+    for path in sorted(changed_set):
+        lines.append(f"  {path}")
+    lines.append("")
+
+    untouched = 0
+    for path in event_files:
+        rows, meta = load_events(path)
+        label = meta.get("label") or os.path.basename(path)
+        executed = {row["m"] for row in rows}
+        overlap = sorted(executed & changed_set)
+
+        lines.append(f"facet  {label}")
+        lines.append(f"  executed {len(executed)} file(s)")
+        if overlap:
+            lines.append(f"  INCONCLUSIVE patch touches {len(overlap)} of them:")
+            for module in overlap:
+                lines.append(f"    {module}")
+            lines.append("    the patch landed here, but possibly not on a path this")
+            lines.append("    facet takes. re-run the facet's test to find out.")
+        else:
+            untouched += 1
+            lines.append("  NOT ADDRESSED the patch touches nothing this facet executes,")
+            lines.append("                so it cannot have changed this behaviour.")
+            if executed:
+                lines.append("                this facet runs through:")
+                for module in sorted(executed)[:8]:
+                    lines.append(f"                  {module}")
+                if len(executed) > 8:
+                    lines.append(f"                  (+{len(executed) - 8} more)")
+        lines.append("")
+
+    if untouched:
+        lines.append(f"{untouched} of {len(event_files)} facet(s) provably not addressed.")
+    else:
+        lines.append("every facet's execution overlaps the patch; none provably untouched.")
+    return "\n".join(lines), untouched
+
+
 # ---------------------------------------------------------------------- cli
 
 
-def parse_args(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="facet-trace",
-        description="Capture one scoped call/return/exception trace of a Python script.",
+def add_trace_args(parser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--script", help="path to a script to run and trace")
+    source.add_argument(
+        "--module",
+        help="module to run instead of a script, e.g. pytest; needed when the "
+        "reproduction has to go through the repo's own test runner to get its "
+        "fixtures and framework bootstrap",
     )
-    parser.add_argument("script", help="path to the script to run and trace")
     parser.add_argument(
         "--prefixes",
         default="",
@@ -461,7 +573,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--trigger",
         default=None,
-        help="function name whose entry starts recording; omit to trace from script start",
+        help="function name whose entry starts recording; omit to trace from the start",
     )
     parser.add_argument("--depth", type=int, default=10, help="depth below the trigger (default 10)")
     parser.add_argument(
@@ -477,49 +589,103 @@ def parse_args(argv: list[str] | None = None):
         help="advisory event budget; over it the header suggests a depth that fits",
     )
     parser.add_argument(
-        "--include-comprehensions",
-        action="store_true",
-        help="record <genexpr>/<listcomp>/<dictcomp>/<setcomp> frames (off by default)",
-    )
-    parser.add_argument(
         "--max-events",
         type=int,
         default=100_000,
         help="hard ceiling on recorded events (default 100000); a safety valve, not a budget",
     )
+    parser.add_argument(
+        "--include-comprehensions",
+        action="store_true",
+        help="record <genexpr>/<listcomp>/<dictcomp>/<setcomp> frames (off by default)",
+    )
+    parser.add_argument(
+        "--census-third-party",
+        action="store_true",
+        help="include site-packages in the out-of-scope report (off by default, "
+        "since a repo's bug is rarely in its dependencies and listing them "
+        "would point the reader at pytest)",
+    )
+    parser.add_argument("--label", default=None, help="what behaviour this facet covers")
     parser.add_argument("--out", default=None, help="write the canonical event list here (.jsonl)")
     parser.add_argument("--root", default=None, help="path root for relative module names (default cwd)")
     parser.add_argument("--json", action="store_true", help="emit a JSON report instead of text")
-    parser.add_argument("script_args", nargs="*", help="arguments passed through to the script")
+    parser.add_argument("rest", nargs="*", help="arguments passed through to the script or module")
+
+
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(
+        prog="facet-trace",
+        description="Scoped execution tracing for coding agents.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    trace_parser = sub.add_parser("trace", help="capture one scoped trace")
+    add_trace_args(trace_parser)
+
+    cover_parser = sub.add_parser(
+        "cover",
+        help="check which facets the current patch cannot have affected",
+    )
+    cover_parser.add_argument("events", nargs="+", help="canonical event files, one per facet")
+    cover_parser.add_argument(
+        "--ref",
+        default=None,
+        help="git ref to diff against (default: the working tree against HEAD)",
+    )
+    cover_parser.add_argument(
+        "--changed",
+        default=None,
+        help="comma-separated changed files, instead of asking git",
+    )
+
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def cmd_trace(args) -> int:
     args.prefixes = [p.strip() for p in args.prefixes.split(",") if p.strip()]
     root = os.path.abspath(args.root or os.getcwd())
 
     recorder = Recorder(
         args.prefixes, args.max_invocations, root,
         args.include_comprehensions, has_trigger=bool(args.trigger),
-        max_events=args.max_events,
+        max_events=args.max_events, census_third_party=args.census_third_party,
     )
 
     if args.trigger:
         predicate = build_predicate(args.trigger, args.depth, recorder)
     else:
-        # no temporal gate: record from script start, depth measured from there
+        # no temporal gate: record from the start, depth measured from there
         predicate = When(
             And(Q(stdlib=False), Q(depth_lte=args.depth), Or(*[Q(kind=k) for k in KINDS])),
             recorder,
         )
 
-    result = run(args.script, args.script_args, predicate)
+    result = run(args.script, args.module, args.rest, predicate)
 
     if args.out:
         with open(args.out, "w") as handle:
             for record in recorder.records:
                 handle.write(json.dumps(record.to_json(), sort_keys=True) + "\n")
+        # Parameters travel with the trace so a later run can be pinned to the
+        # same window; comparing two traces captured at different depths or
+        # scopes would report differences that are only filtering.
+        with open(args.out + ".meta.json", "w") as handle:
+            json.dump(
+                {
+                    "label": args.label,
+                    "script": args.script,
+                    "module": args.module,
+                    "trigger": args.trigger,
+                    "prefixes": args.prefixes,
+                    "depth": args.depth,
+                    "max_invocations": args.max_invocations,
+                    "include_comprehensions": args.include_comprehensions,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
 
     roots = build_tree(recorder.records)
 
@@ -527,18 +693,23 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
+                    "label": args.label,
                     "script": args.script,
+                    "module": args.module,
                     "trigger": args.trigger,
                     "prefixes": args.prefixes,
                     "depth": args.depth,
                     "invocations": recorder.invocations,
                     "recorded_invocations": recorder.recorded_invocations,
                     "events_recorded": len(recorder.records),
+                    "truncated": recorder.truncated,
                     "recorded_modules": dict(recorder.recorded_modules),
                     "out_of_scope": {
                         m: n for m, n in recorder.census.items() if not recorder.in_scope(m)
                     },
-                    "error": None if result.error is None else f"{type(result.error).__name__}: {result.error}",
+                    "error": None
+                    if result.error is None
+                    else f"{type(result.error).__name__}: {result.error}",
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                     "tree": render_tree(roots),
@@ -564,6 +735,23 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"events written to {args.out}")
     return 0
+
+
+def cmd_cover(args) -> int:
+    if args.changed is not None:
+        changed = [c.strip() for c in args.changed.split(",") if c.strip()]
+    else:
+        changed = changed_files_from_git(args.ref)
+    report, _ = coverage_report(args.events, changed)
+    print(report)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command == "trace":
+        return cmd_trace(args)
+    return cmd_cover(args)
 
 
 if __name__ == "__main__":
