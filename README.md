@@ -201,14 +201,30 @@ rarely inside one, and listing them would invite an agent to widen its scope
 into pytest. `--census-third-party` includes them; a prefix naming one
 explicitly still records it.
 
+## The skill
+
+`skill/SKILL.md` is a Claude Code skill that drives the whole loop: split the
+issue into behaviours, write a reproduction per behaviour, trace each, respond
+to the header signals, diagnose, patch, check coverage, re-verify, submit.
+
+```sh
+ln -s "$PWD/skill" ~/.claude/skills/facet-trace
+```
+
+The division of labour is that the tool measures and the skill decides. Nothing
+in the tool calls a model; nothing in the skill is a number the agent has to
+take on trust.
+
 ## Status
 
 Built and tested: the tracer, the header signals, the deterministic tree, the
-canonical event file with its metadata sidecar, and the coverage check.
+canonical event file with its metadata sidecar, the coverage check, and the
+skill.
 
-Designed, not built: the agent skill that drives the whole loop, per-behaviour
-test generation, and the scrubbed pre/post trace diff that would resolve the
-inconclusive cases `cover` escalates.
+Designed, not built: the scrubbed pre/post trace diff, which would resolve the
+inconclusive cases `cover` escalates by re-running a behaviour at its pinned
+parameters and comparing the two event lists. The metadata sidecar exists to
+make that possible later.
 
 ## Limits
 
